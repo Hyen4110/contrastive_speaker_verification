@@ -13,6 +13,7 @@ import torch_optimizer as custom_optim
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 from utils import * 
 
+from pytorch_metric_learning.utils.inference import MatchFinder, InferenceModel
 from pytorch_metric_learning import losses, miners, reducers, distances
 from loss import angleproto, aamsoftmax, contrastive, arcmargin
 from infer import bind_model
@@ -313,72 +314,101 @@ def train_model(settings, config, train_loader, valid_loader, test_loader, scale
  
     def valid(epoch, model, criterion, test=False):
         loader = test_loader if test else valid_loader
-
-        valid_loss = 0.0
-        num_batches = config.n_test // config.batch_size if test else config.n_valid // config.batch_size
-        total_embeddings = np.empty((0,config.embedding_size), int)
-        total_pred, total_label = [], []
+        total_batch = math.ceil(len(loader))
+        val_cost = 0
+        val_acc = []
+        val_label = []
 
         model.eval()           
+        with torch.no_grad():
 
-        if config.version == 2:
-            with torch.no_grad():
+            if config.version == 1:
                 with tqdm(loader, unit="batch") as tepoch:
                     for batch in tepoch:
-                        text = batch['text']
-                        token_ids = text[0].squeeze(1).long().to(device) # [128, 57]
-                        attention_mask = text[1].squeeze(1).long().to(device) # [128, 57]
-                        token_type_ids = text[2].squeeze(1).long().to(device) # [128, 57]
+                        X = batch['X'].to(device)
+                        Y = batch['Y'].to(device)
 
-                        label = batch['label'].long().to(device).view(-1) # [128]
-                        
                         with torch.cuda.amp.autocast():
-                            embeddings, preds = model(token_ids, attention_mask, token_type_ids)
-                            loss = crits['crit_ce'](preds, label)
+                            hypothesis = model(X)
+                            cost = criterion(hypothesis, Y)
 
-                        valid_loss += loss
-                        
-                        # append              
-                        total_pred += torch.argmax(preds, dim=-1).detach().cpu().numpy().tolist()
-                        total_label += label.detach().cpu().numpy().tolist()
-                        
-                if test and (epoch >3):
-                    print(f" testing Confusion Matrix")
-                    print(confusion_matrix(total_label, total_pred))
-                f1_score_ = f1_score(total_label, total_pred, average = 'macro')  
-                accuracy = accuracy_score(total_label, total_pred)
-                print(f"[Epoch {epoch} {'testing' if test else 'validating'}] : loss = {float(valid_loss)/num_batches:.4f}, accuracy = {accuracy:.4f}, f1_score = {f1_score_:.4f}")
+                        val_cost += cost/total_batch
+                        tmp = torch.round(torch.sigmoid(
+                            hypothesis)).detach().cpu().numpy()
+                        val_acc += tmp.tolist()
+                        val_label += Y.detach().cpu().numpy().tolist()
+                return model, config
 
-            return total_embeddings, total_label
-            
-        elif config.version in [3,4]:
-            
-            with torch.no_grad():
+            elif config.version in [2, 4, 7]:
                 with tqdm(loader, unit="batch") as tepoch:
                     for batch in tepoch:
-                        
-                        text = batch['text']
-                        token_ids = text[0].squeeze(1).long().to(device) # [128, 57]
-                        attention_mask = text[1].squeeze(1).long().to(device) # [128, 57]
-                        token_type_ids = text[2].squeeze(1).long().to(device) # [128, 57]
+                        Y = batch['Y'].to(device)
+                        X_1 = batch['X_1'].to(device)
+                        X_2 = batch['X_2'].to(device)
 
-                        label = batch['label'].long().to(device).view(-1) # [128]
-                        
                         with torch.cuda.amp.autocast():
-                            embeddings, preds = model(token_ids, attention_mask, token_type_ids)
-                            loss = crits['crit_ce'](preds, label)
+                            hypothesis = model(X_1, X_2)
+                            cost = criterion(hypothesis, Y)
 
-                        valid_loss += loss
+                        val_cost += cost/total_batch
+                        tmp = torch.round(torch.sigmoid(hypothesis)).detach().cpu().numpy()
+
+                        val_acc += tmp.tolist()
+                        val_label += Y.detach().cpu().numpy().tolist()
+
+                return model, config
+          
+            elif config.version == 3:
+                acc_by_threshold = {'thr_0.6':0, 'thr_0.7': 0, 'thr_0.8': 0,'thr_0.9': 0}
+
+                with tqdm(loader, unit="batch") as tepoch:
+                    for batch in tepoch:
+                        Y = batch['Y'].to(device)
+                        X_1 = batch['left'].to(device)
+                        X_2 = batch['right'].to(device)
                         
-                        # append
-                        total_embeddings = np.vstack([total_embeddings, embeddings.detach().cpu().numpy()])                        
-                        total_pred += torch.argmax(preds, dim=-1).detach().cpu().numpy().tolist()
-                        total_label += label.detach().cpu().numpy().tolist()
-                                                    
-                print(f"[Epoch {epoch} {'testing' if test else 'validating'}] : loss = {float(valid_loss)/num_batches:.4f}")
+                        # threshold 에 따라 inference 실행
+                        for threshold_key in acc_by_threshold.keys():
+                            threshold_num = float(threshold_key.split("_")[1])
+                            match_finder = MatchFinder(distance=distances.CosineSimilarity(), threshold = threshold_num)
+                            inference_model = InferenceModel(model, match_finder=match_finder)
+                            acc_by_threshold[threshold_key] += round(sum(inference_model.is_match(X_1, X_2)==Y.detach().to('cpu').numpy())/(len(Y)*total_batch),3)
 
-            return total_embeddings, total_label
-                
+                        val_acc = round(sum(acc_by_threshold.values())/len(acc_by_threshold.keys()),3)
+                        
+                    print(f'acc_by_threshold: {acc_by_threshold}')
+                    print(f'val_acc : {val_acc} ')
+        
+                best_idx = np.argmax(np.array(list(acc_by_threshold.values())))
+                best_thresold = float(str(list(acc_by_threshold.keys())[best_idx]).split("_")[1])
+                print(f"best threshold: {list(acc_by_threshold.keys())[best_idx]} ({list(acc_by_threshold.values())[best_idx]}) ")
+                return model, config, best_thresold
+
+            elif config.version in [5, 9]:
+                acc_by_threshold = {'thr_0.6':0, 'thr_0.7': 0, 'thr_0.8': 0,'thr_0.9': 0}
+
+                with tqdm(loader, unit="batch") as tepoch:
+                    for batch in tepoch:
+                        Y = batch['Y'].to(device)
+                        X_1 = batch['left'].to(device)
+                        X_2 = batch['right'].to(device)
+                        
+                        # threshold 에 따라 inference 실행
+                        for threshold_key in acc_by_threshold.keys():
+                            threshold_num = float(threshold_key.split("_")[1])
+                            match_finder = MatchFinder(distance=distances.CosineSimilarity(), threshold = threshold_num)
+                            inference_model = InferenceModel(model, match_finder=match_finder)
+                            acc_by_threshold[threshold_key] += round(sum(inference_model.is_match(X_1, X_2)==Y.detach().to('cpu').numpy())/(len(Y)*total_batch),3)
+
+                        val_acc = round(sum(acc_by_threshold.values())/len(acc_by_threshold.keys()),3)
+                        
+                    print(f'acc_by_threshold: {acc_by_threshold}')
+                    print(f'val_acc : {val_acc} ')
+        
+                best_idx = np.argmax(np.array(list(acc_by_threshold.values())))
+                best_thresold = float(str(list(acc_by_threshold.keys())[best_idx]).split("_")[1])
+                print(f"best threshold: {list(acc_by_threshold.keys())[best_idx]} ({list(acc_by_threshold.values())[best_idx]}) ")
+                return model, config, best_thresold
 
 #################################################################################
 #                Let's Start training / validating / testing

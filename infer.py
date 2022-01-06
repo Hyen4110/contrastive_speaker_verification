@@ -1,44 +1,24 @@
 
+import nsml
+
+import os
 import pandas as pd
 import numpy as np
 import pickle
-
-import os
-import librosa
-import librosa.display
-import sklearn.preprocessing
 import warnings
 from tqdm import tqdm
 
 import torch
 import torch_optimizer as custom_optim
-from torch.utils.data import Dataset
-from torch.cuda.amp import autocast
-from torch.cuda.amp import GradScaler
+from torch.cuda.amp import autocast, GradScaler
 import torch.nn.functional as F
 
-from pytorch_metric_learning import losses, miners, samplers, testers, trainers
-from pytorch_metric_learning.utils.accuracy_calculator import AccuracyCalculator
 from pytorch_metric_learning.utils.inference import MatchFinder, InferenceModel
 from pytorch_metric_learning.utils import common_functions as c_f
+from pytorch_metric_learning import losses, miners, reducers, distances
 
-from distances import CosineSimilarity
+from data_loader import get_loaders
 
-from sklearn.metrics import f1_score
-import math
-import argparse
-import nsml
-from nsml import DATASET_PATH
-
-from patches import ConvMixer
-from preprocess import make_left_right
-from resnet import resnet50, resnet18, resnet34, resnet101, ResNet_Trans
-from Custom import CustomDataset, data_split, CustomDataset_2output, FinalDataset2output, FinalDatasetTriple, FinalDatasetTriple_infer
-from cnnlstm import SpeechRecognitionModel, SpeechRecognitionModelShamCosine
-from Loss.arcmargin import ArcMarginProduct
-
-from versions import models, loaders, training, validating
-from Loss import angleproto, aamsoftmax
 
 def calculate_acc(distance, thr, y=None, mode='train'):
     # distances : list
@@ -125,7 +105,7 @@ def bind_model(model, config):
 
         print("trained model loaded!")
 
-    def infer(test_path, config):
+    def infer(config):
         test_loader = get_loaders(config)
         kwargs = {'num_workers': 3, 'pin_memory': True}
 
@@ -153,7 +133,7 @@ def bind_model(model, config):
 
         elif config.version == 3:
             best_threshold = dict_for_infer['best_threshold']
-            match_finder = MatchFinder(distance = CosineSimilarity(), 
+            match_finder = MatchFinder(distance = distances.CosineSimilarity(), 
                                        threshold = best_threshold)
             inference_model = InferenceModel(model, match_finder = match_finder)
 

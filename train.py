@@ -6,18 +6,16 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
 import torch_optimizer as custom_optim
-
-
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
-from utils import * 
+from torch.cuda.amp import GradScaler
 
 from pytorch_metric_learning.utils.inference import MatchFinder, InferenceModel
 from pytorch_metric_learning import losses, miners, reducers, distances
+
 from loss import angleproto, aamsoftmax, contrastive, arcmargin
 from infer import bind_model
 from models import patches, resnet, cnnlstm
+from utils import * 
 
 
 
@@ -104,7 +102,7 @@ def get_crit(config):
     return criterion
 
 def get_optimizer(config, model):
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = GradScaler()
     if config.version == 10:
         margin = arcmargin.ArcMarginProduct(in_feature = 128, 
                                             out_feature = 2,
@@ -122,11 +120,12 @@ def get_optimizer(config, model):
 
     return optimizer, scaler
 
-def initiate(config, train_loader, valid_loader, test_loader):
+def initiate(config, train_loader, valid_loader, mfcc_source):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    optimizer, scaler = get_optimizer(config).to(device)
+
     model = get_model(config).to(device)
-    criterion = get_crit(config).to(device)
+    optimizer, scaler = get_optimizer(config, model).to(device)
+    criterion = get_crit(config)
 
     settings = {'model': model,
                 'scaler' : scaler,
@@ -139,7 +138,7 @@ def initiate(config, train_loader, valid_loader, test_loader):
     if config.pause: # related to nsml system
         nsml.paused(scope=locals())
 
-    return train_model(settings, config, train_loader, valid_loader, test_loader, scaler)
+    return train_model(settings, config, train_loader, valid_loader)
 
 
 ####################################################################
@@ -148,7 +147,7 @@ def initiate(config, train_loader, valid_loader, test_loader):
 #
 ####################################################################
 
-def train_model(settings, config, train_loader, valid_loader, test_loader, scaler):
+def train_model(settings, config, train_loader, valid_loader):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     model = settings['model']
@@ -313,7 +312,7 @@ def train_model(settings, config, train_loader, valid_loader, test_loader, scale
 
  
     def valid(epoch, model, criterion, test=False):
-        loader = test_loader if test else valid_loader
+        loader = valid_loader
         total_batch = math.ceil(len(loader))
         val_cost = 0
         val_acc = []
@@ -408,34 +407,25 @@ def train_model(settings, config, train_loader, valid_loader, test_loader, scale
                 best_idx = np.argmax(np.array(list(acc_by_threshold.values())))
                 best_thresold = float(str(list(acc_by_threshold.keys())[best_idx]).split("_")[1])
                 print(f"best threshold: {list(acc_by_threshold.keys())[best_idx]} ({list(acc_by_threshold.values())[best_idx]}) ")
+                
                 return model, config, best_thresold
 
 #################################################################################
 #                Let's Start training / validating / testing
 #################################################################################
-
-    if config.version ==2 :
-        for epoch in range(1, config.num_epochs+1):
-            train(epoch, model, optimizer, criterion, scaler) # trian
-            valid(epoch, model, criterion, test=False) # valid
-            valid(epoch, model, criterion, test=True) # test
-
-            save_model(config, epoch, model)
-                
-    else:
-        for epoch in range(1, config.num_epochs+1):
-            # train with tsne
-            embeddings, label = train(epoch, model, optimizer, criterion, scaler) # trian
-            label_center = plot_t_SNE(config, epoch, embeddings, label, state='train')  # dictionary {label: center(128,)}           
-            
-            # valid 
-            valid(epoch, model, criterion,test=False)
-            
-            # test with tsne
-            embeddings, label = valid(epoch, model, criterion, test=True)
-            get_accacy_similarity(config, epoch, embeddings, label, label_center)
-            plot_t_SNE(config, epoch, embeddings, label, state='test')
-            
-            #save model
-            save_model(config, epoch, model) # Model Save
     
+    for epoch in range(1, config.epochs+1):
+        train(epoch, model, optimizer, criterion, scaler) # trian
+        
+        # valid
+        if config.version in [3, 5, 9, 10]:
+            model, config = valid(epoch, model, criterion, test = False) # valid
+            dict_for_infer = {'model': model.state_dict(),
+                              'config': config,}
+        else:
+            model, config, best_threshold = valid(epoch, model, criterion, test = False) # valid
+            dict_for_infer = {'model': model.state_dict(),
+                              'config': config,
+                              'best_threshold': best_threshold}
+        nsml.save(epoch)
+
